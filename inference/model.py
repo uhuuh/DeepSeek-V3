@@ -58,7 +58,8 @@ class ModelArgs:
     dim: int = 2048
     inter_dim: int = 10944
     moe_inter_dim: int = 1408
-    n_layers: int = 27
+    # n_layers: int = 27
+    n_layers: int = 2
     n_dense_layers: int = 1
     n_heads: int = 16
     # moe
@@ -119,6 +120,7 @@ class ParallelEmbedding(nn.Module):
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
             x[mask] = 0
+        # 修改16B配置文件支持更大的vocab_size, 不然cuda算子报错超过索引范围, 可能ckpt中分词器配置文件下错了
         y = F.embedding(x, self.weight)
         if world_size > 1:
             y[mask] = 0
@@ -765,7 +767,7 @@ class Transformer(nn.Module):
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """
         Forward pass for the Transformer model.

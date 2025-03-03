@@ -26,8 +26,8 @@ def sample(logits, temperature: float = 1.0):
     probs = torch.softmax(logits, dim=-1)
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
-
-@torch.inference_mode()
+# 不使用inference模式, 不然报错inference模式下不能原地更新tensor
+# @torch.inference_mode()
 def generate(
     model: Transformer,
     prompt_tokens: List[List[int]],
@@ -79,6 +79,7 @@ def generate(
 
 
 def main(
+    i,
     ckpt_path: str,
     config: str,
     input_file: str = "",
@@ -98,14 +99,18 @@ def main(
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
     """
     world_size = int(os.getenv("WORLD_SIZE", "1"))
-    rank = int(os.getenv("RANK", "0"))
-    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    # rank = int(os.getenv("RANK", "0"))
+    # local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    rank = local_rank = i
+    torch.set_grad_enabled(False)
+
     if world_size > 1:
-        dist.init_process_group("nccl")
+        # dist.init_process_group("nccl")
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
     global print
     if rank != 0:
         print = lambda *_, **__: None
-    torch.cuda.set_device(local_rank)
+    # torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(965)
@@ -116,7 +121,7 @@ def main(
         model = Transformer(args)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+    # load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
     if interactive:
         messages = []
@@ -174,12 +179,25 @@ if __name__ == "__main__":
         AssertionError: If neither input-file nor interactive mode is specified.
     """
     parser = ArgumentParser()
-    parser.add_argument("--ckpt-path", type=str, required=True)
-    parser.add_argument("--config", type=str, required=True)
+    # parser.add_argument("--ckpt-path", type=str, required=True)
+    # parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--input-file", type=str, default="")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.2)
     args = parser.parse_args()
+    args.ckpt_path = "./ckpt"
+    args.config = "./configs/config_16B.json"
+    args.input_file = "./input.txt"
+
+    world_size = 2
+    os.environ['WORLD_SIZE'] = str(world_size) 
+    os.environ['MASTER_ADDR'] = 'localhost'      
+    os.environ['MASTER_PORT'] = '12355'         
+    os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    # main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    torch.multiprocessing.spawn(main, 
+                                args=(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature), 
+                                nprocs=world_size)
