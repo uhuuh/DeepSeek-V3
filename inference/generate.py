@@ -50,7 +50,7 @@ def generate(
     """
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
-    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens)) # 各种约束情况下的实际最大长度
     tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
@@ -110,7 +110,7 @@ def main(
     global print
     if rank != 0:
         print = lambda *_, **__: None
-    # torch.cuda.set_device(local_rank)
+    # torch.cuda.set_device(local_rank) # 实际上只有一张卡, 这里每个worker设置会报错
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(965)

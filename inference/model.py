@@ -363,7 +363,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         return ramp_func
 
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    if seqlen > args.original_seq_len:
+    if seqlen > args.original_seq_len: # TODO
         low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
@@ -420,6 +420,7 @@ class MLA(nn.Module):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
 
+        # attn处的张量并行, 效果类似每个worker只处理部分头
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
@@ -455,12 +456,33 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
+
+        '''mermaid
+flowchart TD
+    x["`x (dim)`"]
+    q["`q (...)`"]
+    kv["`kv (...)`"]
+    q_nope["`q_nope (qk_nope_head_dim)`"]
+    q_pe["`q_pe (qk_rope_head_dim)`"]
+    q_nope2["`q_nope (kv_lora_rank)`"]
+    kv2["`kv (kv_lora_rank)`"]
+    k_pe["`k_pe (qk_rope_head_dim)`"]
+    
+    x ---|wq| q
+    x ---|w_kv_a| kv
+    q ---|split| q_nope
+    q ---|split| q_pe
+    kv ---|split| kv2
+    kv ---|split| k_pe
+    q_nope ---|w_kv_b1| q_nope2
+        '''
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        if self.q_lora_rank == 0:
+        if self.q_lora_rank == 0: # TODO
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+        # wq是ColumnParallelLinear, 输入参数是完整(使用n_heads)但是内部会按worker划分, 得到部分结果, 因此后面使用部分(使用n_local_heads)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
@@ -572,7 +594,7 @@ class Gate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        scores = linear(x, self.weight)
+        scores = linear(x, self.weight) # x * weight^T
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
@@ -581,19 +603,23 @@ class Gate(nn.Module):
         if self.bias is not None:
             scores = scores + self.bias
         if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
+            scores = scores.view(x.size(0), self.n_groups, -1) # 每个位置下的所有专家的选择概率按 n_groups 划分组
             if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+                group_scores = scores.amax(dim=-1) # 获取每个组中最大值
             else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1) # 获取每个组中最大两个值之和
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            # 创建mask, 选中的专家组为False, 反之为True
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
+            # score中为选中的专家组设为False, 然后最后一维拉直
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+        # 在剩余的所有专家中选出topk个
         indices = torch.topk(scores, self.topk, dim=-1)[1]
+        # 获取选中专家的原始分数
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
+        weights *= self.route_scale # 类似文本生成策略时的温度系数
         return weights.type_as(x), indices
 
 
@@ -655,12 +681,13 @@ class MoE(nn.Module):
         super().__init__()
         self.dim = args.dim
         assert args.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
-        self.n_routed_experts = args.n_routed_experts
+        self.n_routed_experts = args.n_routed_experts # 专家总数
         self.n_local_experts = args.n_routed_experts // world_size
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args)
+        # Expert与MLP一样, 是两层MLP加中间swiglu激活函数, 两个入参分别表示输入维度和中间维度, 但是Expert没有使用张量并行
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
@@ -675,6 +702,7 @@ class MoE(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
+        # 专家并行, 类似并行解码, 每个worker只处理自己范围内的专家, 最后all_reduce同步所有结果
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
@@ -684,12 +712,13 @@ class MoE(nn.Module):
             if counts[i] == 0:
                 continue
             expert = self.experts[i]
+            # torch.where(condition) 用于返回满足 condition 条件的索引, 如果 n 维, 那么返回是一个 n 大小的元组
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
         if world_size > 1:
             dist.all_reduce(y)
-        return (y + z).view(shape)
+        return (y + z).view(shape) # TODO 为什么这里是加呢?
 
 
 class Block(nn.Module):
@@ -780,7 +809,7 @@ class Transformer(nn.Module):
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
         seqlen = tokens.size(1)
-        h = self.embed(tokens)
+        h = self.embed(tokens) # 每个worker只处理部分范围内的token, 范围外的结果为0, 最后all_reduce得到最终结果
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
         if seqlen > 1:
