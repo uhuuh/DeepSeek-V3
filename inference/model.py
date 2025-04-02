@@ -424,9 +424,11 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
+            self.wq_a = Linear(self.dim, self.q_lora_rank) # 负责q的压缩，文章是说q压缩的目的是减少训练时激活值 NOTE
             self.q_norm = RMSNorm(self.q_lora_rank)
+            # q_lora转化为q_rope NOTE 为什么 q_rope的转化需要用上column_parallel_linear?
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+        # 进行kv的压缩和求k_rope
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
@@ -456,33 +458,14 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-
-        '''mermaid
-flowchart TD
-    x["`x (dim)`"]
-    q["`q (...)`"]
-    kv["`kv (...)`"]
-    q_nope["`q_nope (qk_nope_head_dim)`"]
-    q_pe["`q_pe (qk_rope_head_dim)`"]
-    q_nope2["`q_nope (kv_lora_rank)`"]
-    kv2["`kv (kv_lora_rank)`"]
-    k_pe["`k_pe (qk_rope_head_dim)`"]
-    
-    x ---|wq| q
-    x ---|w_kv_a| kv
-    q ---|split| q_nope
-    q ---|split| q_pe
-    kv ---|split| kv2
-    kv ---|split| k_pe
-    q_nope ---|w_kv_b1| q_nope2
-        '''
+        # 计算流程可以参考这篇博客https://zhuanlan.zhihu.com/p/21380265337
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        if self.q_lora_rank == 0: # TODO
+        if self.q_lora_rank == 0: # NOTE
             q = self.wq(x)
         else:
+            # NOTE 为什么在执行RoPE的转化前都需要进行一次norm
             q = self.wq_b(self.q_norm(self.wq_a(x)))
-        # wq是ColumnParallelLinear, 输入参数是完整(使用n_heads)但是内部会按worker划分, 得到部分结果, 因此后面使用部分(使用n_local_heads)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
@@ -501,9 +484,11 @@ flowchart TD
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            # 压缩后的q还原, 同时这个权重矩阵也吸收了k的还原矩阵
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            # NOTE 这里感觉和文章的pe拼接方式使用对不上
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if mask is not None:
@@ -513,6 +498,7 @@ flowchart TD
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            # 负责v的还原操作，文章中说吸收到o矩阵中，但这里还是单独存在了
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
         x = self.wo(x.flatten(2))
         return x
@@ -707,6 +693,7 @@ class MoE(nn.Module):
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
         y = torch.zeros_like(x)
+        # torch.bincount统计输入中每个值的出现次数
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
