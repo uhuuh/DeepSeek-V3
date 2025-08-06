@@ -150,9 +150,18 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
     """
-    if weight.element_size() > 1:
+    '''
+    实际上三种情况
+    - 权重bf16，激活值bf16，bf16乘法
+    - 权重量化fp8，激活值bf16，权重反量化为bf16后bf16乘法
+    - 权重量化fp8，激活值bf16，激活值量化为fp8后fp8乘法（这种应该是最快的)
+    '''
+    if weight.element_size() > 1: # bf16 or fp16 or fp32
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
+        # 行列按照block size切块，每一个块一个线程，一个线程中将块乘上scale后保存
+        # 反量化的结果与默认类型一致，但是计算时候块转为fp32与scale相乘
+        # TODO 中间使用fp32来乘
         weight = weight_dequant(weight, weight.scale)
         return F.linear(x, weight, bias)
     else:
@@ -484,11 +493,13 @@ class MLA(nn.Module):
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            # 压缩后的q还原, 同时这个权重矩阵也吸收了k的还原矩阵
+            # 同时这个权重矩阵也吸收了k的还原矩阵
+            # q_nope [bsz, seqlen, n_local_heads, qk_nope_head_dim] -> [bsz, seqlen, n_local_heads, kv_lora_rank]
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             # NOTE 这里感觉和文章的pe拼接方式使用对不上
+            # q_nope -> scores = [bsz, seqlen, n_local_heads, kv_lora_rank] -> [bsz, seqlen, n_local_heads, end_pos]
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if mask is not None:

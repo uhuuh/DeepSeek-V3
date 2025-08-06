@@ -86,6 +86,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
 
 
 if __name__ == "__main__":
+    # 感觉只是修改了一下权重中参数的名字，和权重按照tp进行切分
     parser = ArgumentParser()
     parser.add_argument("--hf-ckpt-path", type=str, required=True)
     parser.add_argument("--save-path", type=str, required=True)

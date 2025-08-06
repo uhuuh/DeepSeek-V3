@@ -23,6 +23,7 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
+    # TODO 448合适吗？
     s = tl.max(tl.abs(x)) / 448.
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
@@ -47,6 +48,7 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
     assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+    # 下面是按照x元素总数来划分块，每一个块使用一个scale
     grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
     return y, s
@@ -109,7 +111,7 @@ fp8_gemm_configs = [
     Config({'BLOCK_SIZE_M': block_m, 'BLOCK_SIZE_N': block_n, 'BLOCK_SIZE_K': 128}, num_stages=num_stages, num_warps=8)
     for block_m in [16, 32, 64] for block_n in [32, 64, 128] for num_stages in [3, 4, 5, 6]
 ]
-
+# 调用时遇到新key，执行所有config选出最优的配置，以便下次遇到重复的key复用配置
 @triton.autotune(configs=fp8_gemm_configs, key=['N', 'K'])
 @triton.jit
 def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
@@ -182,10 +184,12 @@ def fp8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Ten
     """
     assert a.is_contiguous() and b.is_contiguous(), 'Input tensors must be contiguous'
     assert a_s.is_contiguous() and b_s.is_contiguous(), 'Scaling factor tensors must be contiguous'
+    # a [M, K], b [N, K]
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
+    # 大致上按照分块矩阵乘来计算
     fp8_gemm_kernel[grid](a, b, c, a_s, b_s, M, N, K)
     return c
